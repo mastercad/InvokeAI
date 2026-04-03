@@ -1,0 +1,130 @@
+# ==============================================================================
+# InvokeAI — NVIDIA Jetson AGX Orin 64 GB
+# JetPack 6.1  ·  L4T r36.4  ·  CUDA 12.6  ·  Python 3.10  ·  aarch64
+#
+# Standard PyTorch wheels (PyPI / download.pytorch.org) for linux_aarch64
+# DO NOT use the Jetson GPU — they are CPU-only builds.
+# The ONLY CUDA-enabled torch for Jetson comes from NVIDIA's own dustynv/l4t-
+# pytorch image, compiled specifically for the Tegra SoC + JetPack driver stack.
+#
+# This Dockerfile:
+#   1. Uses dustynv/l4t-pytorch as sole base (NVIDIA's CUDA torch 2.4.x)
+#   2. Creates venv with --system-site-packages so torch/torchvision from
+#      the base image are inherited — pip will NOT overwrite them with PyPI
+#   3. Adjusts ONLY the in-container copy of pyproject.toml:
+#        requires-python  >=3.11 → >=3.10  (Jetson ships Python 3.10)
+#        torch~=2.7.0     →  torch>=2.4.0  (NVIDIA Jetson torch is 2.4.x)
+#   4. Patches 4 InvokeAI source files that use typing.Self (Python 3.11+)
+#      to import Self from typing_extensions instead (already a dep, works 3.9+)
+#      The repo files on disk are NEVER touched.
+# ==============================================================================
+
+ARG L4T_TAG=r36.4.0
+
+#### Web UI -----------------------------------------------------------------------
+FROM docker.io/node:22-slim AS web-builder
+ENV PNPM_HOME="/pnpm"
+ENV PATH="$PNPM_HOME:$PATH"
+RUN corepack use pnpm@10.x && corepack enable
+
+WORKDIR /build
+COPY invokeai/frontend/web/ ./
+RUN --mount=type=cache,target=/pnpm/store \
+    pnpm install --frozen-lockfile
+RUN npx vite build
+
+#### Backend -----------------------------------------------------------------------
+FROM dustynv/l4t-pytorch:${L4T_TAG}
+
+ARG DEBIAN_FRONTEND=noninteractive
+RUN rm -f /etc/apt/apt.conf.d/docker-clean; \
+    echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' > /etc/apt/apt.conf.d/keep-cache
+RUN --mount=type=cache,target=/var/cache/apt \
+    --mount=type=cache,target=/var/lib/apt \
+    apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        git \
+        gosu \
+        libglib2.0-0 \
+        libgl1 \
+        libglx-mesa0 \
+        build-essential \
+        libopencv-dev \
+        libstdc++-10-dev \
+        python3.10-venv
+
+# Disable the Jetson pip mirror shipped in dustynv base (jetson.webredirect.org
+# does not carry standard packages and fails DNS resolution inside Docker).
+ENV PIP_INDEX_URL=https://pypi.org/simple
+ENV PIP_EXTRA_INDEX_URL=""
+RUN printf '[global]\nindex-url = https://pypi.org/simple\nextra-index-url =\n' \
+        > /etc/pip.conf && \
+    rm -f /root/.config/pip/pip.conf /root/.pip/pip.conf 2>/dev/null || true
+
+ENV \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    VIRTUAL_ENV=/opt/venv \
+    INVOKEAI_SRC=/opt/invokeai \
+    INVOKEAI_ROOT=/invokeai \
+    INVOKEAI_HOST=0.0.0.0 \
+    INVOKEAI_PORT=9090 \
+    INVOKEAI_DEVICE=cuda \
+    CUDA_HOME=/usr/local/cuda \
+    PATH="/opt/venv/bin:/usr/local/cuda/bin:$PATH" \
+    LD_LIBRARY_PATH="/usr/local/cuda/lib64:$LD_LIBRARY_PATH" \
+    CONTAINER_UID=${CONTAINER_UID:-1000} \
+    CONTAINER_GID=${CONTAINER_GID:-1000} \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    BNB_CUDA_VERSION=126
+
+# Venv with --system-site-packages: inherits NVIDIA's CUDA torch 2.4.x
+RUN python3 -m venv --system-site-packages "${VIRTUAL_ENV}"
+RUN pip install --upgrade pip setuptools wheel
+
+WORKDIR ${INVOKEAI_SRC}
+COPY invokeai ./invokeai
+COPY pyproject.toml ./
+
+# opencv-contrib-python >= 4.8 is required for cv2.typing (added in OpenCV 4.8).
+# The dustynv base image ships a custom NVIDIA-compiled OpenCV 4.10.0 that does
+# NOT include the cv2.typing Python submodule. MatLike is used only as a type
+# annotation, so a minimal stub is sufficient.
+RUN printf 'import numpy as np\nMatLike = np.ndarray\n' \
+        > /usr/local/lib/python3.10/dist-packages/cv2/typing.py
+
+# --- Patch 1: pyproject.toml (in-container copy only, repo file untouched) ----
+# a) Relax Python version: InvokeAI targets >=3.11 but Jetson ships 3.10
+# b) Relax torch version:  ~=2.7.0 would pull CPU wheel; >=2.4.0 accepts
+#    the NVIDIA CUDA torch 2.4.x inherited from --system-site-packages
+RUN sed -i \
+        -e 's/requires-python = ">=3\.11/requires-python = ">=3.10/' \
+        -e 's/"torch~=2\.7\.0"/"torch>=2.4.0"/' \
+        pyproject.toml
+
+# --- Patch 2: typing.Self (Python 3.11+ stdlib, not in 3.10) ------------------
+# typing_extensions.Self is already a transitive dep and works on Python 3.9+.
+# We prepend a one-line shim to every file in model_manager/configs/ that uses
+# Self.  This sets typing.Self on the module object BEFORE any "from typing
+# import Self" runs, making it work on Python 3.10 regardless of import format
+# (single-line or multiline).  Files without Self are untouched.
+RUN for f in $(grep -rl "\bSelf\b" invokeai/backend/model_manager/configs/); do \
+        { printf 'import typing as _t; import typing_extensions as _te; _t.Self = getattr(_t, "Self", _te.Self)  # jetson py310 compat\n'; cat "$f"; } \
+            > /tmp/_shim && mv /tmp/_shim "$f"; \
+    done
+
+# Install all dependencies (pip sees torch as already satisfied via system-site-packages)
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -e "."
+
+# patchmatch
+RUN cd /usr/lib/$(uname -p)-linux-gnu/pkgconfig/ && \
+    ln -sf opencv4.pc opencv.pc && \
+    python3 -c "from patchmatch import patch_match"
+
+RUN mkdir -p ${INVOKEAI_ROOT} && chown -R ${CONTAINER_UID}:${CONTAINER_GID} ${INVOKEAI_ROOT}
+
+COPY --from=web-builder /build/dist ${INVOKEAI_SRC}/invokeai/frontend/web/dist
+COPY docker/docker-entrypoint.sh ./
+ENTRYPOINT ["/opt/invokeai/docker-entrypoint.sh"]
+CMD ["invokeai-web"]

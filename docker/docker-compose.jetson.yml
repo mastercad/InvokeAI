@@ -1,0 +1,141 @@
+# InvokeAI — docker compose for NVIDIA Jetson AGX Orin 64 GB
+#
+# ── Prerequisites on the Jetson host ──────────────────────────────────────────
+#
+#  1. JetPack 6.x (L4T r36.x) with Docker ≥ 24 installed via JetPack SDK.
+#
+#  2. nvidia-container-runtime installed:
+#       sudo apt install nvidia-container-runtime
+#
+#  3. Docker configured to use the NVIDIA runtime by default.
+#     Create / edit  /etc/docker/daemon.json:
+#
+#       {
+#         "default-runtime": "nvidia",
+#         "runtimes": {
+#           "nvidia": {
+#             "path": "nvidia-container-runtime",
+#             "runtimeArgs": []
+#           }
+#         }
+#       }
+#
+#     Then restart Docker:
+#       sudo systemctl restart docker
+#
+#     Verify GPU access inside containers:
+#       docker run --rm dustynv/l4t-pytorch:r36.4.0 python3 -c \
+#         "import torch; print(torch.cuda.is_available())"
+#       # expected output: True
+#
+#  4. Copy docker/.env.jetson → docker/.env and adjust the paths.
+#
+# ── Usage ─────────────────────────────────────────────────────────────────────
+#
+#   cd <project-root>
+#
+#   # First run / after code changes — rebuild the image:
+#   docker compose -f docker/docker-compose.jetson.yml up --build -d
+#
+#   # Subsequent starts (no rebuild needed):
+#   docker compose -f docker/docker-compose.jetson.yml up -d
+#
+#   # Follow logs:
+#   docker compose -f docker/docker-compose.jetson.yml logs -f
+#
+#   # Stop:
+#   docker compose -f docker/docker-compose.jetson.yml down
+#
+# ──────────────────────────────────────────────────────────────────────────────
+
+services:
+  invokeai:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile_jetson
+      # Override the JetPack version if needed (default: r36.4.0 = JetPack 6.1)
+      # args:
+      #   L4T_TAG: r36.2.0   # JetPack 6.0
+    image: invokeai-jetson:latest
+    container_name: invokeai-jetson
+
+    # nvidia-container-runtime mounts all Jetson CUDA/GPU device nodes
+    # automatically when NVIDIA_VISIBLE_DEVICES=all is set.
+    runtime: nvidia
+
+    environment:
+      - INVOKEAI_ROOT=${CONTAINER_INVOKEAI_ROOT:-/invokeai}
+      - HF_HOME=${HF_HOME:-/invokeai/.cache/huggingface}
+      # Bind to all interfaces so the UI is reachable from the network.
+      # With network_mode: host these env vars are passed directly to InvokeAI.
+      - INVOKEAI_HOST=0.0.0.0
+      - INVOKEAI_PORT=${INVOKEAI_PORT:-9091}
+      # Expose all Jetson CUDA devices (iGPU, NVDec, NVEnc, …)
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+      - CONTAINER_UID=${CONTAINER_UID:-1000}
+      - CONTAINER_GID=${CONTAINER_GID:-1000}
+      # ── Jetson Unified Memory (UMA) Konfiguration ──────────────────────────
+      # AGX Orin hat kein separates VRAM — CPU und GPU teilen denselben 64 GB
+      # Pool. PyTorch sieht auf Jetson ~61 GB CUDA-Speicher (UMA).
+      #
+      # MAX_CACHE_RAM_GB=48     : RAM-Modell-Cache explizit auf 48 GB setzen.
+      #                           Überschreibt Auto-Heuristik (50% RAM = ~30 GB).
+      #                           Auf Jetson UMA ist RAM==VRAM physisch gleich.
+      # DEVICE_WORKING_MEM_GB=8 : 8 GB für Inference-Berechnungen reservieren
+      #                           (Default: 3 GB). Verhindert OOM bei hohen
+      #                           Auflösungen und großen Attention-Maps.
+      # ENABLE_PARTIAL_LOADING  : Streamt Modell-Gewichte schrittweise in CUDA
+      #                           statt alle auf einmal. Auf UMA fast kostenlos,
+      #                           verhindert Spitzen-OOM im Denoise-Loop.
+      # PRECISION=float16       : Halbiert Speicherbedarf vs. float32.
+      #                           CUDA 12.6 / Ampere unterstützt FP16 nativ.
+      - INVOKEAI_MAX_CACHE_RAM_GB=48
+      - INVOKEAI_DEVICE_WORKING_MEM_GB=8
+      - INVOKEAI_ENABLE_PARTIAL_LOADING=true
+      - INVOKEAI_PRECISION=float16
+      # NICHT expandable_segments:True verwenden! Jetson L4T-CUDA-Driver unterstützt
+      # die dafür nötige CUDA VMM API (cuMemCreate/cuMemMap) NICHT — jede CUDA-
+      # Allokation schlägt dann mit "CUDA driver error: out of memory" fehl,
+      # unabhängig davon wie viel Speicher frei ist.
+      # max_split_size_mb:512 verhindert Fragmentation ohne VMM-Abhängigkeit.
+      - PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
+
+    # network_mode: host means the container shares the host network namespace.
+    # Port mappings (ports:) are incompatible with host networking and are
+    # ignored by Docker — remove them to avoid a Docker Compose warning.
+    # InvokeAI is reachable directly at http://<jetson-ip>:9090
+
+    volumes:
+      # InvokeAI runtime data (outputs, database, configs)
+      - type: bind
+        source: ${HOST_INVOKEAI_ROOT:-~/invokeai}
+        target: ${CONTAINER_INVOKEAI_ROOT:-/invokeai}
+        bind:
+          create_host_path: true
+      # Models are stored on the large data disk to avoid filling the system disk.
+      # InvokeAI stores all models under $INVOKEAI_ROOT/models/ — mount that
+      # subtree directly onto the host path so nothing is duplicated.
+      - type: bind
+        source: ${HOST_MODELS_DIR:-/mnt/data/models}
+        target: ${CONTAINER_INVOKEAI_ROOT:-/invokeai}/models
+        bind:
+          create_host_path: true
+      # Share the host HuggingFace cache so models are not re-downloaded
+      - ${HF_HOME:-~/.cache/huggingface}:/invokeai/.cache/huggingface
+      # Backup/additional model directories — mounted read-only so InvokeAI can
+      # scan and reference them (inplace), without touching the originals.
+      - type: bind
+        source: ${HOST_MODELS_BACKUP:-/mnt/data/home_backup/agxorin/invokeai/models}
+        target: /invokeai/models_backup
+        read_only: true
+        bind:
+          create_host_path: false
+
+    tty: true
+    stdin_open: true
+    restart: unless-stopped
+
+    # Host networking gives the web UI direct access to the host network
+    # interface — no port-forwarding quirks, simplest option for embedded use.
+    network_mode: host
